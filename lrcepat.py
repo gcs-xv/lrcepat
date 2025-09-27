@@ -1,27 +1,166 @@
 import re
-import io
-import unicodedata
-from datetime import datetime
+from io import BytesIO
+from datetime import datetime, date
 import streamlit as st
 
-try:
-    import docx2txt
-except Exception:
-    docx2txt = None
+# ---------- UTIL: Tanggal & Hari (ID) ----------
+HARI_ID = ["Senin","Selasa","Rabu","Kamis","Jumat","Sabtu","Minggu"]
+BULAN_ID = ["01","02","03","04","05","06","07","08","09","10","11","12"]
 
-from docx import Document  # untuk export .docx
+def today_id_string(d=None):
+    """Return 'Hari (dd/mm/YYYY)' dalam bahasa Indonesia."""
+    d = d or date.today()
+    hari = HARI_ID[d.weekday()]
+    return f"{hari} ({d.strftime('%d/%m/%Y')})"
 
-# ==============================
-# Util: Locale Indonesia (hari)
-# ==============================
-HARI_ID = {
-    0: "Senin", 1: "Selasa", 2: "Rabu", 3: "Kamis",
-    4: "Jumat", 5: "Sabtu", 6: "Minggu"
+# ---------- UTIL: Baca DOCX ----------
+def read_docx_to_text(file):
+    try:
+        from docx import Document
+    except Exception as e:
+        st.error("python-docx belum terinstal. Tambahkan `python-docx` di requirements.txt.")
+        raise
+    doc = Document(file)
+    lines = []
+    for p in doc.paragraphs:
+        lines.append(p.text)
+    return "\n".join(lines)
+
+# ---------- PREPROCESS: Bersihkan prefix chat WhatsApp ----------
+WHATSAPP_PREFIX_RE = re.compile(
+    r'^\[\d{1,2}/\d{1,2}/\d{2,4},\s*\d{1,2}\.\d{2}\.\d{2}\]\s*[^:]{1,80}:\s*',
+    flags=re.MULTILINE
+)
+
+def strip_whatsapp_prefix(raw_text: str) -> str:
+    # Hapus prefix “[dd/mm/yy, hh.mm.ss] Pengirim: ”
+    return WHATSAPP_PREFIX_RE.sub("", raw_text)
+
+# ---------- PARSER: Ambil blok review ----------
+# Blok mulai dengan "N. Nama : ..." (toleran spasi/buletan/variasi titik)
+BLOCK_SPLIT_RE = re.compile(
+    r'(?P<header>^\s*(?P<num>\d{1,3})\s*[\.\)]\s*Nama\s*:.*?)'   # start
+    r'(?=\n\s*\d{1,3}\s*[\.\)]\s*Nama\b|\n\s*VIP\b|\n\s*BAKSOS\b|\Z)',  # until next block/section
+    flags=re.DOTALL | re.MULTILINE
+)
+
+# Field regex toleran spasi & variasi bullet
+FIELD_RE = {
+    "nama": re.compile(r'^\s*\d{1,3}\s*[\.\)]\s*Nama\s*:\s*(?P<val>.+?)\s*$', re.MULTILINE),
+    "tgl_lahir": re.compile(r'^\s*•\s*Tanggal lahir\s*:\s*(?P<val>.+?)\s*$', re.MULTILINE),
+    "rm": re.compile(r'^\s*•\s*RM\s*:\s*(?P<val>.+?)\s*$', re.MULTILINE),
+    # Diagnosa bisa multi-baris sampai sebelum "•  Tindakan" / "•  Kontrol" / "•  DPJP" dsb
+    "diagnosa": re.compile(
+        r'^\s*•\s*Diagnosa\s*:\s*(?P<val>.*?)'
+        r'(?=\n\s*•\s*Tindakan\b|\n\s*•\s*Kontrol\b|\n\s*•\s*DPJP\b|\n\s*•\s*No\.\s*Telp\b|\n\s*•\s*Operator\b|\Z)',
+        re.DOTALL | re.MULTILINE
+    ),
+    # Tindakan bisa berupa satu baris atau bullet-bullet "* ...". Kita serap semuanya hingga field berikutnya
+    "tindakan": re.compile(
+        r'^\s*•\s*Tindakan\s*:\s*(?P<val>.*?)'
+        r'(?=\n\s*•\s*Kontrol\b|\n\s*•\s*DPJP\b|\n\s*•\s*No\.\s*Telp\b|\n\s*•\s*Operator\b|\Z)',
+        re.DOTALL | re.MULTILINE
+    ),
+    "kontrol": re.compile(r'^\s*•\s*Kontrol\s*:\s*(?P<val>.+?)\s*$', re.MULTILINE),
+    "dpjp": re.compile(r'^\s*•\s*DPJP\s*:\s*(?P<val>.+?)\s*$', re.MULTILINE),
+    "telp": re.compile(r'^\s*•\s*No\.\s*Telp\.\s*:\s*(?P<val>.+?)\s*$', re.MULTILINE),
+    "operator": re.compile(r'^\s*•\s*Operator\s*:\s*(?P<val>.+?)\s*$', re.MULTILINE),
 }
 
-# ==============================
-# Hierarki DPJP (dari user)
-# ==============================
+def tidy_multiline(value: str) -> str:
+    """Rapihkan spasi dan pertahankan bullet `*` pada Tindakan."""
+    if value is None:
+        return None
+    # Normalisasi line endings dan trim trailing spaces
+    lines = [ln.rstrip() for ln in value.strip().splitlines()]
+    return "\n".join(lines).strip()
+
+def parse_block(txt: str):
+    data = {}
+    # nomor
+    m_num = re.search(r'^\s*(\d{1,3})\s*[\.\)]\s*Nama\b', txt, flags=re.MULTILINE)
+    data["no"] = int(m_num.group(1)) if m_num else None
+
+    # each field
+    for key, rx in FIELD_RE.items():
+        m = rx.search(txt)
+        val = m.group("val").strip() if m else None
+        if key in ("diagnosa", "tindakan") and val:
+            val = tidy_multiline(val)
+        data[key] = val
+    return data
+
+def extract_reviews(clean_text: str):
+    blocks = []
+    for m in BLOCK_SPLIT_RE.finditer(clean_text):
+        chunk = m.group(0)
+        blocks.append(parse_block(chunk))
+    # Urutkan sesuai nomor; kalau ada nomor None, taruh belakang
+    blocks.sort(key=lambda d: (9999 if d["no"] is None else d["no"]))
+    return blocks
+
+# ---------- COUNTERS ----------
+def count_summary(blocks):
+    nums = [b["no"] for b in blocks if isinstance(b["no"], int)]
+    total = max(nums) if nums else len(blocks)
+
+    def is_konsultasi(b):
+        t = (b.get("tindakan") or "").lower()
+        # cek baris yang mengandung 'konsultasi'
+        return any("konsultasi" in ln.strip().lower() for ln in t.splitlines())
+
+    def is_terjaring_ga(b):
+        k = (b.get("kontrol") or "")
+        return ("general anestesi" in k.lower()) and ("menunggu penjadwalan" in k.lower())
+
+    konsul = sum(1 for b in blocks if is_konsultasi(b))
+    terjaring = sum(1 for b in blocks if is_terjaring_ga(b))
+    tindakan = max(total - konsul - terjaring, 0)
+    return total, tindakan, konsul, terjaring
+
+# ---------- OUTPUT FORMAT ----------
+BULLET = "•"
+INDENT = " "  # biar konsisten, pakai spasi biasa
+def fmt_field(label, value, allow_multiline=False):
+    if not value:
+        value = "Missing"
+    if allow_multiline and "\n" in value:
+        # Setiap baris tindakan yang diawali * kita pertahankan
+        return f"{BULLET}{INDENT} {label:<14}: {value}"
+    return f"{BULLET}{INDENT} {label:<14}: {value}"
+
+def format_review_section(blocks):
+    if not blocks:
+        return "POLI INTEGRASI\n\n(No data)"
+    out = ["POLI INTEGRASI", ""]
+    for b in blocks:
+        no = b["no"] if b["no"] is not None else "Missing"
+        out.append(f"{no:>2}. Nama            : {b.get('nama') or 'Missing'}")
+        out.append(fmt_field("Tanggal lahir", b.get("tgl_lahir")))
+        out.append(fmt_field("RM", b.get("rm")))
+        out.append(fmt_field("Diagnosa", b.get("diagnosa"), allow_multiline=True))
+        # Pastikan tindakan menampilkan bullet-bullet '*' di baris berikutnya tanpa rusak
+        tindakan_text = b.get("tindakan")
+        if tindakan_text and "\n" in tindakan_text:
+            # Pastikan baris bullet `*` tetap di bawahnya
+            first_line, *rest = tindakan_text.splitlines()
+            if first_line.strip().startswith("*"):
+                # Tidak ada header teks setelah colon, kita taruh kosong lalu baris bullet
+                header = f"{BULLET}{INDENT} {'Tindakan':<14}: "
+                body = "\n".join([ln for ln in tindakan_text.splitlines()])
+                out.append(header + body)  # biar sejajar
+            else:
+                out.append(fmt_field("Tindakan", tindakan_text, allow_multiline=True))
+        else:
+            out.append(fmt_field("Tindakan", tindakan_text))
+        out.append(fmt_field("Kontrol", b.get("kontrol")))
+        out.append(fmt_field("DPJP", b.get("dpjp")))
+        out.append(fmt_field("No. Telp.", b.get("telp")))
+        out.append(fmt_field("Operator", b.get("operator")))
+        out.append("")  # spasi antar blok
+    return "\n".join(out).rstrip()
+
+# ---------- DPJP HIERARCHY ----------
 DPJP_ORDER = [
     "drg. Andi Tajrin, M.Kes., Sp.B.M.M., Subsp. C.O.M.(K)",
     "drg. Mohammad Gazali, MARS., Sp.B.M.M., Subsp.T.M.T.M.J.(K)",
@@ -34,290 +173,128 @@ DPJP_ORDER = [
     "drg. Timurwati, Sp.B.M.M.",
     "drg. Husnul Basyar, Sp. B.M.M.",
     "drg. Husni Mubarak, Sp. B.M.M.",
-    "drg. Carolina Stevanie, Sp.B.M.M."
+    "drg. Carolina Stevanie, Sp.B.M.M.",
 ]
 
-# =======================================================
-# Normalisasi teks WA & helper buat jaga format karakter
-# =======================================================
-FIGURE_SPACE = "\u2007"  # untuk rata angka di depan ( )
-BULLET = "•"             # bullet utama
-STAR = "*"               # sub-bullet tindakan
-
-def normalize_text(s: str) -> str:
-    # Bersihin karakter arah/ZWSP dan normalisasi unicode
-    s = unicodedata.normalize("NFKC", s)
-    # Hilangkan \r, rapikan newline
-    s = s.replace("\r", "")
-    # Samakan variasi bullet ke satu bentuk
-    s = s.replace("•⁠", "•").replace("• ", "•").replace("• ", "• ")
-    # Samakan 'Nama    :', spasi aneh, dll
-    s = re.sub(r"[ \t]+", " ", s)
-    # Balikin newline ganda berlebihan
-    s = re.sub(r"\n{3,}", "\n\n", s)
-    return s
-
-# =======================================================
-# Parsing blok review pasien
-# =======================================================
-# Pola awal: "^(\d+)\.\s*Nama\s*: (.*)" (toleran huruf besar/kecil & variasi spasi)
-HEADER_RE = re.compile(
-    r"(?mi)^\s*(\d+)\.\s*Nama\s*:?\s*(.+?)\s*$"
-)
-
-def split_blocks(raw_text: str):
-    """Pisah teks jadi blok-blok review berdasarkan baris 'X. Nama : ...' """
-    blocks = []
-    positions = []
-    for m in HEADER_RE.finditer(raw_text):
-        positions.append((m.start(), m.end(), m.group(1), m.group(2).strip()))
-    for i, (start, end, num, nama) in enumerate(positions):
-        stop = positions[i+1][0] if i+1 < len(positions) else len(raw_text)
-        chunk = raw_text[start:stop].strip()
-        blocks.append((int(num), nama, chunk))
-    return blocks
-
-def extract_field(patterns, text, default="Missing", flags=re.IGNORECASE):
-    if isinstance(patterns, str):
-        patterns = [patterns]
-    for pat in patterns:
-        m = re.search(pat, text, flags)
-        if m:
-            val = m.group(1).strip()
-            val = re.sub(r"\s+", " ", val)  # rapikan spasi internal
-            return val
-    return default
-
-def extract_multiline_after(label, text):
-    """
-    Ambil multiline setelah '• Tindakan :' sampai ketemu '• ' field berikutnya.
-    Izinkan baris yang diawali '*' sebagai item.
-    """
-    # Temukan awal "• Tindakan"
-    m = re.search(r"(?mi)^\s*•\s*Tindakan\s*:?(.*)$", text)
-    if not m:
-        return []
-
-    start = m.end()
-    rest = text[start:]
-    lines = []
-    for line in rest.splitlines():
-        # Jika ketemu field berikutnya (•  Kontrol/DPJP/Diagnosa/No. Telp/Operator/dll) maka stop
-        if re.match(r"(?mi)^\s*•\s*(Tanggal lahir|RM|Diagnosa|Kontrol|DPJP|No\.? Telp|Operator)\s*:?", line):
-            break
-        line = line.rstrip()
-        if line.strip().startswith("*"):
-            # Simpan apa adanya setelah normalisasi ringan
-            lines.append(re.sub(r"\s+", " ", line))
-        elif "Konsultasi" == line.strip():
-            lines.append("Konsultasi")
-        elif line.strip().startswith(BULLET):
-            # baris bullet yang salah tempat → treat as item jika setelah Tindakan
-            candidate = line.strip()[1:].strip()
-            if candidate:
-                lines.append(candidate)
-        elif line.strip() == "":
+def collect_dpjp(blocks):
+    found = set()
+    for b in blocks:
+        val = b.get("dpjp")
+        if not val:
             continue
-    return lines
+        # Bersihkan trailing titik/koma ekstra
+        norm = val.strip()
+        # Kadang ada variasi titik-koma — cukup pakai norm langsung
+        found.add(norm)
+    # Urut sesuai order; tampilkan hanya yang muncul
+    ordered = [name for name in DPJP_ORDER if any(name in f for f in found)]
+    # Kalau ada nama lain yang tidak di list order, taruh setelahnya
+    extras = [f for f in found if not any(k in f for k in DPJP_ORDER)]
+    return ordered + sorted(extras)
 
-def parse_block(num, nama, chunk):
-    # Field-field single line
-    tgl_lahir = extract_field(r"(?mi)^\s*•\s*Tanggal lahir\s*:?\s*(.+)$", chunk)
-    rm = extract_field(r"(?mi)^\s*•\s*RM\s*:?\s*(.+)$", chunk)
-    diagnosa = extract_field(r"(?mi)^\s*•\s*Diagnosa\s*:?\s*(.+)$", chunk)
-    kontrol = extract_field(r"(?mi)^\s*•\s*Kontrol\s*:?\s*(.+)$", chunk)
-    dpjp = extract_field(r"(?mi)^\s*•\s*DPJP\s*:?\s*(.+)$", chunk)
-    telp = extract_field(r"(?mi)^\s*•\s*No\.?\s*Telp\.?\s*:?\s*(.+)$", chunk)
-    operator = extract_field(r"(?mi)^\s*•\s*Operator\s*:?\s*(.+)$", chunk)
+# ---------- STREAMLIT APP ----------
+st.set_page_config(page_title="Review Poli – Parser WA", layout="wide")
 
-    # Tindakan multiline
-    tindakan_items = extract_multiline_after("Tindakan", chunk)
-    if (not tindakan_items) and re.search(r"(?mi)^\s*•\s*Tindakan\s*:?\s*(.+)$", chunk):
-        # kalau ada 1 baris tindakan setelah kolon
-        single = extract_field(r"(?mi)^\s*•\s*Tindakan\s*:?\s*(.+)$", chunk)
-        if single and single != "Missing":
-            tindakan_items = [single]
+st.title("Review Pasien Poli – Parser Chat WA ➜ Format RSGMP")
+st.caption("Upload file .docx/.txt berisi copy-paste WhatsApp. Aplikasi akan menyaring blok review saja, merapikan, dan membuat rekap otomatis.")
 
-    # Flag konsultasi
-    is_konsul = any(re.search(r"(?i)\bKonsultasi\b", it) for it in tindakan_items)
+colL, colR = st.columns([1,1])
 
-    # Flag terjaring GA (cek di Kontrol ada frasa "dalam general anestesi (menunggu penjadwalan)")
-    is_terjaring_ga = bool(re.search(r"(?i)dalam\s+general\s+anestesi\s*\(menunggu\s+penjadwalan\)", kontrol))
+with colL:
+    uploaded = st.file_uploader("Upload file (.docx atau .txt)", type=["docx", "txt"])
+    raw_text = ""
+    if uploaded is not None:
+        if uploaded.name.lower().endswith(".docx"):
+            raw_text = read_docx_to_text(uploaded)
+        else:
+            raw_text = uploaded.read().decode("utf-8", errors="ignore")
+    paste = st.text_area("Atau paste chat di sini", height=180, placeholder="[26/09/25, 10.15.48] Nama: 11. Nama : ...")
+    if not raw_text and paste:
+        raw_text = paste
 
-    return {
-        "no": num,
-        "nama": nama,
-        "tgl_lahir": tgl_lahir,
-        "rm": rm,
-        "diagnosa": diagnosa,
-        "tindakan_items": tindakan_items,
-        "kontrol": kontrol,
-        "dpjp": dpjp,
-        "telp": telp,
-        "operator": operator,
-        "is_konsul": is_konsul,
-        "is_terjaring_ga": is_terjaring_ga,
-        "raw": chunk
-    }
+with colR:
+    # Tanggal otomatis hari ini, bisa diedit
+    default_date_str = today_id_string()
+    header_date = st.text_input("Tanggal di header (otomatis)", value=default_date_str)
 
-def format_patient_block(p):
-    # jaga format persis (pakai figure space di depan nomor)
-    lines = []
-    no_str = f"{FIGURE_SPACE}{p['no']}."
-    lines.append(f"{no_str}\u200A\u200ANama\u200A\u200A\u200A\u200A          : {p['nama']}")
-    lines.append(f"{BULLET}  Tanggal lahir  : {p['tgl_lahir']}")
-    lines.append(f"{BULLET}  RM             : {p['rm']}")
-    lines.append(f"{BULLET}  Diagnosa       : {p['diagnosa']}")
+    vip_manual = st.text_input("Jumlah VIP (isi manual)", value="0")
+    baksos_manual = st.text_input("Jumlah Baksos (isi manual)", value="0")
+    chief = st.text_input("Chief jaga poli (isi manual)", value="Isi manual")
 
-    # Tindakan
-    lines.append(f"{BULLET}  Tindakan       : " + ("" if p['tindakan_items'] else "Missing"))
-    for it in p['tindakan_items']:
-        # tampilkan sebagai sub-bullet dengan '* '
-        # pastikan ada dua spasi indent agar rapi
-        lines.append(f"   {STAR} {it}")
+go = st.button("Proses")
 
-    lines.append(f"{BULLET}  Kontrol        : {p['kontrol']}")
-    lines.append(f"{BULLET}  DPJP           : {p['dpjp']}")
-    lines.append(f"{BULLET}  No. Telp.      : {p['telp']}")
-    lines.append(f"{BULLET}  Operator       : {p['operator']}")
-    return "\n".join(lines)
-
-def export_docx(full_text: str) -> bytes:
-    doc = Document()
-    for para in full_text.split("\n"):
-        doc.add_paragraph(para)
-    buf = io.BytesIO()
-    doc.save(buf)
-    buf.seek(0)
-    return buf.read()
-
-# =======================
-# Streamlit UI
-# =======================
-st.set_page_config(page_title="Review Poli Integrasi RSGMP UNHAS", layout="wide")
-st.title("Review Poli Integrasi – RSGMP UNHAS")
-
-st.markdown("Upload **file chat** (.docx atau .txt) dari WhatsApp pada hari tersebut. Aplikasi akan mengekstrak review pasien, merapikan format, dan menghitung rekap otomatis.")
-
-uploaded = st.file_uploader("Upload file chat (.docx / .txt)", type=["docx", "txt"])
-
-# Header date defaults (today)
-today = datetime.now()
-hari_default = HARI_ID[today.weekday()]
-tgl_default = today.strftime("%d/%m/%Y")
-header_day = st.text_input("Hari (otomatis):", value=hari_default)
-header_date = st.text_input("Tanggal (otomatis):", value=tgl_default)
-
-chief = st.text_input("Chief jaga poli (isi manual):", value="Isi manual")
-
-colA, colB, colC = st.columns(3)
-with colA:
-    vip_count = st.number_input("VIP (jumlah, manual)", min_value=0, value=0, step=1)
-with colB:
-    baksos_count = st.number_input("Baksos (jumlah, manual)", min_value=0, value=0, step=1)
-with colC:
-    st.write("")
-
-vip_text = st.text_area("Isi daftar VIP (opsional, format bebas – akan ditempel apa adanya):", height=160)
-baksos_text = st.text_area("Isi daftar BAKSOS (opsional, format bebas – akan ditempel apa adanya):", height=160)
-
-if uploaded:
-    # Baca text
-    if uploaded.type == "text/plain":
-        raw_text = uploaded.read().decode("utf-8", errors="replace")
-    else:
-        # docx
-        if docx2txt is None:
-            st.error("docx2txt belum terinstal. Jalankan: pip install docx2txt")
-            st.stop()
-        raw_text = docx2txt.process(uploaded)
-
-    text = normalize_text(raw_text)
-
-    # Split blok & parse
-    blocks = split_blocks(text)
-    parsed = [parse_block(n, nm, ch) for (n, nm, ch) in blocks]
-
-    if not parsed:
-        st.error("Tidak ditemukan blok review dengan pola 'X. Nama : ...'. Pastikan format chat sesuai.")
+if go:
+    if not raw_text.strip():
+        st.warning("Silakan upload/paste chat terlebih dahulu.")
         st.stop()
 
-    # Urut sesuai nomor
-    parsed.sort(key=lambda x: x["no"])
+    # 1) Bersihkan prefix chat WA
+    cleaned = strip_whatsapp_prefix(raw_text)
 
-    # Hitung rekap:
-    # Jumlah pasien = nomor terbesar (sesuai aturan user)
-    max_no = max(p["no"] for p in parsed)
-    konsul = sum(1 for p in parsed if p["is_konsul"])
-    terjaring_ga = sum(1 for p in parsed if p["is_terjaring_ga"])
-    tindakan = max_no - konsul - terjaring_ga
+    # 2) Normalisasi bullet '•' (beberapa copy WA pakai karakter ZWSP/zwj)
+    # Hapus Zero-width characters
+    cleaned = cleaned.replace("\u200b", "").replace("\u200c", "").replace("\u200d", "").replace("\ufeff", "")
 
-    # Kumpulkan DPJP yang muncul
-    dpjp_set = set()
-    for p in parsed:
-        val = p["dpjp"]
-        if val and val != "Missing":
-            dpjp_set.add(val.strip())
+    # Normalisasi label bullet ke satu bentuk konsisten: "•  Label  : ..."
+    # (Biarkan variasi spasi, regex field sudah toleran)
+    # Tidak perlu penggantian agresif agar tidak merusak baris
 
-    # Urutkan DPJP sesuai hierarki tapi hanya yang muncul
-    dpjp_list = [name for name in DPJP_ORDER if any(name.lower() in d.lower() for d in dpjp_set)]
-    # Tambahkan DPJP di luar list hierarki ke paling bawah (jaga-jaga)
-    extra_dpjp = [d for d in sorted(dpjp_set) if not any(base.lower() in d.lower() for base in DPJP_ORDER)]
-    dpjp_final = dpjp_list + extra_dpjp
+    # 3) Ekstrak blok review
+    blocks = extract_reviews(cleaned)
 
-    # Bangun output
-    header = f"Review jumlah pasien Poli Bedah Mulut dan Maksilofasial RSGMP UNHAS, {header_day} ({header_date})"
-    summary_lines = [
-        "",
-        f"Jumlah pasien    : {max_no:02d} Pasien ",
-        f"Tindakan         : {tindakan:02d} Pasien ",
-        f"Konsultasi       : {konsul:02d} Pasien",
-        f"Terjaring GA     : {terjaring_ga:02d} Pasien",
-        f"VIP              : {vip_count:02d} Pasien",
-        f"Baksos           : {baksos_count:02d} Pasien ",
-        "",
+    if not blocks:
+        st.error("Tidak ditemukan blok review. Pastikan ada baris seperti '11. Nama : ...' di dalam chat.")
+        with st.expander("Lihat cuplikan teks setelah dibersihkan"):
+            st.code(cleaned[:4000])
+        st.stop()
+
+    # 4) Hitung ringkasan
+    total, tindakan, konsul, terjaring = count_summary(blocks)
+
+    # 5) Format section pasien
+    section_reviews = format_review_section(blocks)
+
+    # 6) DPJP list (urut sesuai hierarki dan hanya yang muncul)
+    dpjp_list = collect_dpjp(blocks)
+
+    # 7) Bangun output akhir
+    header = f"Review jumlah pasien Poli Bedah Mulut dan Maksilofasial RSGMP UNHAS, {header_date}\n"
+    resume = (
+        f"\nJumlah pasien    : {total:02d} Pasien \n"
+        f"Tindakan         : {tindakan:02d} Pasien \n"
+        f"Konsultasi       : {konsul:02d} Pasien\n"
+        f"Terjaring GA     : {terjaring:02d} Pasien\n"
+        f"VIP              : {int(vip_manual):02d} Pasien\n"
+        f"Baksos           : {int(baksos_manual):02d} Pasien \n"
+        f"\n------------------------------------------------------------\n\n"
+    )
+
+    footer_date = header_date
+    footer = [
         "------------------------------------------------------------",
         "",
-        "POLI INTEGRASI",
-        ""
-    ]
-
-    patient_text = "\n\n".join([format_patient_block(p) for p in parsed])
-
-    # VIP & Baksos sections (manual paste)
-    vip_section = ""
-    if vip_text.strip():
-        vip_section = "\n\nVIP\n\n" + vip_text.strip()
-
-    baksos_section = ""
-    if baksos_text.strip():
-        baksos_section = "\n\nBAKSOS CCC\n\n" + baksos_text.strip()
-
-    footer_lines = [
-        "",
-        "------------------------------------------------------------",
-        "",
-        f"{header_day}, {header_date}",
+        footer_date.replace(" (", ", ").replace(")", ""),  # contoh: "Jumat (26/09/2025)" ➜ "Jumat, 26/09/2025"
         "",
         "Chief jaga poli :",
-        chief if chief.strip() else "Isi manual",
+        chief,
         "",
-        "DPJP :"
+        "DPJP :",
     ]
-    for i, d in enumerate(dpjp_final, start=1):
-        footer_lines.append(f"{i}. {d}")
+    if dpjp_list:
+        for i, name in enumerate(dpjp_list, 1):
+            footer.append(f"{i}. {name}")
+    else:
+        footer.append("(Tidak ada DPJP terdeteksi)")
+    footer_text = "\n".join(footer)
 
-    full = header + "\n" + "\n".join(summary_lines) + patient_text + vip_section + baksos_section + "\n\n" + "\n".join(footer_lines)
+    final_text = header + resume + section_reviews + "\n\n" + footer_text
 
-    st.subheader("Hasil (format dipertahankan)")
-    st.code(full, language="text")
+    st.subheader("Hasil Akhir (siap copy-paste)")
+    st.code(final_text)
 
-    # Unduhan
-    txt_bytes = full.encode("utf-8")
-    st.download_button("Download .txt", data=txt_bytes, file_name=f"review_poli_{header_date.replace('/','-')}.txt", mime="text/plain")
+    # Download .txt
+    bio = BytesIO(final_text.encode("utf-8"))
+    st.download_button("Download sebagai .txt", data=bio, file_name="review_poli.txt", mime="text/plain")
 
-    docx_bytes = export_docx(full)
-    st.download_button("Download .docx", data=docx_bytes, file_name=f"review_poli_{header_date.replace('/','-')}.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-
-else:
-    st.info("Silakan upload file chat terlebih dahulu (.docx atau .txt).")
+    with st.expander("Debug (opsional) – Lihat blok terdeteksi"):
+        st.write(blocks)
