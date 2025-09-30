@@ -1,422 +1,354 @@
-import re
+# streamlit_app.py
+# =================
+# Aplikasi Streamlit untuk membuat rekap pasien dari chat WA (.docx/.txt)
+# Fitur:
+# - Bersihkan header WhatsApp & karakter zero-width
+# - Ekstrak blok "XX. Nama : ..."
+# - Deteksi BAKSOS vs non-BAKSOS
+# - Rekap otomatis (Total, Tindakan, Konsultasi, Terjaring GA, VIP, Baksos)
+# - Prioritas klasifikasi: jika ada 'tindakan' ber-prosedur -> Tindakan, else -> Konsultasi
+# - Heuristik 'Terjaring GA' bisa diubah di sidebar
+# - Hasil akhir diformat seperti contoh, + tombol download .txt
+
 import io
-import unicodedata
-from datetime import datetime
-from collections import defaultdict, OrderedDict
+import re
+from pathlib import Path
+from typing import List, Tuple, Dict, Any, Optional
 
 import streamlit as st
-from docx import Document
 
-# ==========================
-# Helpers: cleaning
-# ==========================
-def strip_invisibles(s: str) -> str:
-    if s is None:
-        return ""
-    # buang char kontrol tapi biarkan \n\t
-    s = "".join(ch for ch in s if unicodedata.category(ch)[0] != "C" or ch in ("\n", "\t"))
-    # buang ZWSP, ZWNJ, WJ, NBSP, NNBSP
-    s = (s.replace("\u200b", "")
-           .replace("\u200c", "")
-           .replace("\u200d", "")
-           .replace("\u2060", "")
-           .replace("\ufeff", "")
-           .replace("\u00a0", " ")
-           .replace("\u202f", " "))
-    # seragamkan colon
-    s = s.replace("：", ":")
-    # rapikan spasi ganda
-    s = re.sub(r"[ \t]+", " ", s)
-    return s.strip()
+# ============ UTIL ============
 
-def remove_wa_prefix(line: str) -> str:
-    # [26/09/25, 10.15.48] Nama: ...
-    return re.sub(r"^\[\d{1,2}/\d{1,2}/\d{2,4},[^\]]+\]\s*[^:]+:\s*", "", line).strip()
+_ZW = "\u200b\u200c\u200d\u2060\ufeff"  # zero widths + BOM
+ZW_TRANS = dict.fromkeys(map(ord, _ZW), None)
 
-def normalize_bullet(line: str) -> str:
-    l = line.lstrip()
-    if re.match(r"^[•\-\*]\s*", l):
-        return "* " + re.sub(r"^[•\-\*]\s*", "", l)
-    return line
+WA_HEADER_RE = re.compile(
+    r"""^\[
+        \d{2}/\d{2}/\d{2},\s*      # tanggal
+        \d{1,2}\.\d{2}\.\d{2}      # jam
+    \]\s[^:]+:\s*                  # nama pengirim sampai titik dua
+    """,
+    re.MULTILINE | re.VERBOSE,
+)
 
-def collapse_softwraps(lines):
-    # gabungkan baris lanjutan yg jelas bukan field baru/section/bullet
-    out = []
-    buf = ""
-    def flush():
-        nonlocal buf
-        if buf:
-            out.append(buf)
-            buf = ""
-    for ln in lines:
-        if not ln.strip():
-            flush()
-            continue
-        # deteksi start blok, key:val, bullet, SECTION
-        if (re.match(r"^\s*\d{1,3}[.)]?\s*Nama\s*:", ln, flags=re.I) or
-            re.match(r"^\s*[A-Za-z].+?:", ln) or
-            re.match(r"^\s*\*\s+", ln) or
-            is_section_title(ln)):
-            flush()
-            out.append(ln)
-        else:
-            # baris lanjutan → sambung
-            if buf:
-                buf += " " + ln.strip()
+START_RE = re.compile(
+    r"""(?m)                    # MULTILINE
+    ^\s*
+    (\d{1,3})\.\s*              # nomor 1-3 digit
+    Nama\s*:\s*.+$              # "Nama : ..."
+    """,
+    re.VERBOSE,
+)
+
+SECTION_RE = re.compile(
+    r"(?m)^\s*(POLI\s+INTEGRASI|BAKSOS\b[^\n]*)\s*$"
+)
+
+DIVIDER_RE = re.compile(r"(?m)^\s*-{6,}\s*$")  # garis pemisah bila ada
+
+def read_text_from_upload(uploaded) -> str:
+    name = uploaded.name.lower()
+    if name.endswith(".docx"):
+        # baca docx
+        try:
+            from docx import Document
+        except ImportError:
+            st.error("Paket `python-docx` belum terpasang. Tambahkan di requirements.txt")
+            st.stop()
+        # Streamlit kasih file-like; simpan buffer sementara ke memori
+        data = uploaded.read()
+        bio = io.BytesIO(data)
+        doc = Document(bio)
+        return "\n".join(p.text for p in doc.paragraphs)
+    else:
+        # teks biasa
+        raw = uploaded.read()
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return raw.decode("latin-1", errors="replace")
+
+def normalize(text: str) -> str:
+    text = text.translate(ZW_TRANS)
+    text = text.replace("\xa0", " ")
+    text = re.sub(r"Read more|‎Read more", "", text)
+    text = WA_HEADER_RE.sub("", text)
+    # rapikan trailing spaces
+    text = "\n".join(line.rstrip() for line in text.splitlines())
+    return text
+
+def find_sections(text: str) -> List[Tuple[int, str]]:
+    """
+    Temukan header section ("POLI INTEGRASI", "BAKSOS ...") dengan index start.
+    return list of (pos, name)
+    """
+    secs = [(m.start(), m.group(1).strip()) for m in SECTION_RE.finditer(text)]
+    secs.sort(key=lambda x: x[0])
+    return secs
+
+def extract_blocks_with_section(text: str):
+    """
+    Menghasilkan list blok: dict {num, block, section, span}
+    section: "POLI INTEGRASI" / "BAKSOS ..." / None
+    """
+    t = normalize(text)
+    sections = find_sections(t)
+
+    # indeks awal setiap blok "XX. Nama :"
+    starts = [(m.start(), m.end(), int(m.group(1))) for m in START_RE.finditer(t)]
+    results = []
+    if not starts:
+        return results
+
+    def section_for_pos(pos: int) -> Optional[str]:
+        # cari section terakhir sebelum pos
+        prev = None
+        for spos, sname in sections:
+            if spos <= pos:
+                prev = sname
             else:
-                buf = ln.strip()
-    flush()
-    return out
+                break
+        return prev
 
-# ==========================
-# Section detection
-# ==========================
-SECTION_LABELS = [
-    "POLI INTEGRASI",
-    "VIP",
-    "BAKSOS",
-    "BAKSOS CCC",
+    for i, (spos, epos, num) in enumerate(starts):
+        end = starts[i + 1][0] if i + 1 < len(starts) else len(t)
+        raw_block = t[spos:end].rstrip()
+
+        # potong jika ketemu header section/divider berikutnya di dalam raw_block
+        split_pat = re.compile(
+            r"(?m)^\s*(POLI\s+INTEGRASI|BAKSOS\b.*)$|^\s*-{6,}\s*$"
+        )
+        pieces = split_pat.split(raw_block, maxsplit=1)
+        block = pieces[0].rstrip() if pieces else raw_block
+
+        sec = section_for_pos(spos)
+        results.append(
+            {"num": num, "block": block, "section": sec, "span": (spos, end)}
+        )
+
+    # urutkan by nomor
+    results.sort(key=lambda d: d["num"])
+    return results
+
+# ============ HEURISTIK KLASIFIKASI ============
+
+DEFAULT_PROCEDURE_KEYWORDS = [
+    "Odontektomi", "Ekstraksi", "Cuci luka", "Aff hecting", "Aff drain",
+    "Wound Debridement", "Reposisi", "IDW", "Composite Wiring",
+    "Sinus washout", "Marsupialisasi", "Alveolektomi", "Enukleasi", "Apeks reseksi",
 ]
 
-def is_section_title(line: str) -> bool:
-    raw = strip_invisibles(line)
-    # match “POLI INTEGRASI”, “VIP”, “BAKSOS …” (huruf besar, boleh spasi)
-    if raw.upper() in [s.upper() for s in SECTION_LABELS]:
-        return True
-    # amankan variasi: baris kapital penuh tanpa titik/colon
-    if re.match(r"^[A-Z ]{3,}$", raw) and ":" not in raw:
-        return True
+def has_keyword(s: str, keywords: List[str]) -> bool:
+    s_low = s.lower()
+    for kw in keywords:
+        if kw.lower() in s_low:
+            return True
     return False
 
-def canon_section(line: str) -> str:
-    raw = strip_invisibles(line).upper()
-    for s in SECTION_LABELS:
-        if raw == s.upper():
-            return s
-    # fallback: pakai raw
-    return strip_invisibles(line)
+def classify_block(block_text: str, proc_keywords: List[str], ga_keywords: List[str], exclude_postop: bool):
+    """
+    Kembalikan dict flags:
+      - has_consult (ada kata 'Konsultasi' pada Tindakan)
+      - has_procedure (ada kata kunci tindakan di Tindakan)
+      - classify: 'TINDAKAN' / 'KONSULTASI'
+      - terjaring_ga: True/False
+      - vip: True/False
+    Aturan klasifikasi:
+      - Jika has_procedure -> TINDAKAN
+      - else -> KONSULTASI
+      - Terjaring GA jika ada kata kunci GA, dan (opsional) bukan kasus post-op (POD)
+    """
+    # cari sub-bagian Tindakan & Diagnosa (opsional)
+    tindakan_match = re.search(r"(?ms)^\s*•\s*.*Tindakan\s*:\s*(.+?)(?:^\s*•|\Z)", block_text)
+    diagnosa_match = re.search(r"(?m)^\s*•\s*.*Diagnosa\s*:\s*(.+)$", block_text)
 
-# ==========================
-# DPJP canonical
-# ==========================
-DPJP_CANONICAL = OrderedDict({
-    "mohammad gazali": "drg. Mohammad Gazali, MARS., Sp.B.M.M., Subsp.T.M.T.M.J.(K)",
-    "abul fauzi": "drg. Abul Fauzi, Sp.B.M.M., Subsp.T.M.T.M.J.(K)",
-    "m. irfan rasul": "drg. M. Irfan Rasul, Ph.D., Sp.B.M.M., Subsp.C.O.M.(K)",
-    "m irfan rasul": "drg. M. Irfan Rasul, Ph.D., Sp.B.M.M., Subsp.C.O.M.(K)",
-    "mukhtar nur anam": "drg. Mukhtar Nur Anam, Sp.B.M.M.",
-    "husnul basyar": "drg. Husnul Basyar, Sp. B.M.M.",
-    "husni mubarak": "drg. Husni Mubarak, Sp.B.M.M.",
-    "nurwahida": "drg. Nurwahida, M.KG., Sp.B.M.M., Subsp.C.O.M.(K)",
-    "andi tajrin": "drg. Andi Tajrin, M.Kes., Sp.B.M.M., Subsp. C.O.M.(K)",
-    "carolina stevanie": "drg. Carolina Stevanie, Sp.B.M.M.",
-    "timurwati": "drg. Timurwati, Sp.B.M.M.",
-    "yossy yoanita": "drg. Yossy Yoanita Ariestiana, Sp.B.M.M., Subsp.Ortognat-D(K).",
-})
+    tindakan = tindakan_match.group(1).strip() if tindakan_match else ""
+    diagnosa = diagnosa_match.group(1).strip() if diagnosa_match else ""
 
-DPJP_ORDER = [
-    "drg. Mohammad Gazali, MARS., Sp.B.M.M., Subsp.T.M.T.M.J.(K)",
-    "drg. Abul Fauzi, Sp.B.M.M., Subsp.T.M.T.M.J.(K)",
-    "drg. M. Irfan Rasul, Ph.D., Sp.B.M.M., Subsp.C.O.M.(K)",
-    "drg. Mukhtar Nur Anam, Sp.B.M.M.",
-    "drg. Husnul Basyar, Sp. B.M.M.",
-    "drg. Husni Mubarak, Sp.B.M.M.",
-    "drg. Nurwahida, M.KG., Sp.B.M.M., Subsp.C.O.M.(K)",
-    "drg. Andi Tajrin, M.Kes., Sp.B.M.M., Subsp. C.O.M.(K)",
-    "drg. Carolina Stevanie, Sp.B.M.M.",
-    "drg. Timurwati, Sp.B.M.M.",
-    "drg. Yossy Yoanita Ariestiana, Sp.B.M.M., Subsp.Ortognat-D(K).",
-]
+    has_consult = "konsultasi" in tindakan.lower()
+    has_procedure = has_keyword(tindakan, proc_keywords)
 
-def canonicalize_dpjp(s: str) -> str:
-    if not s:
-        return s
-    s = s.replace("Drg.", "drg.").replace("DRG.", "drg.")
-    s = re.sub(r"\bdrg\.\s*drg\.\s*", "drg. ", s, flags=re.I)
-    s = strip_invisibles(s)
-    low = s.lower()
-    name_only = re.sub(r"^drg\.\s*", "", low)
-    name_only = re.sub(r",.*$", "", name_only).strip()
-    for k, v in DPJP_CANONICAL.items():
-        if k in name_only:
-            return v
-    return s
+    # post-op indicator
+    is_postop = ("pod" in diagnosa.lower()) or ("post operasi" in tindakan.lower())
 
-# ==========================
-# Parsing logic
-# ==========================
-FIELD_ALIASES = {
-    "nama": r"Nama",
-    "tgl": r"Tanggal lahir",
-    "rm": r"RM",
-    "diagnosa": r"Diagnosa",
-    "tindakan": r"Tindakan",
-    "kontrol": r"Kontrol",
-    "dpjp": r"DPJP",
-    "telp": r"No\.?\s*Telp\.?",
-    "operator": r"Operator",
-}
-KEY_PATTERN = re.compile(r"^([A-Za-z .]+)\s*:\s*(.*)$")
+    # GA
+    text_for_ga = (tindakan + "\n" + diagnosa)
+    ga_hit = has_keyword(text_for_ga, ga_keywords)
+    terjaring_ga = ga_hit and (not is_postop if exclude_postop else True)
 
-START_BLOCK = re.compile(r"^\s*(\d{1,3})[.)]?\s*Nama\s*:\s*(.*)$", flags=re.I)
+    vip = "vip" in (tindakan + "\n" + diagnosa).lower()
 
-def parse_chat(text: str):
-    # pre-process
-    lines = [normalize_bullet(strip_invisibles(remove_wa_prefix(l))) for l in text.splitlines()]
-    lines = [l for l in lines if l is not None]
-    lines = collapse_softwraps(lines)
+    classify = "TINDAKAN" if has_procedure else "KONSULTASI"
+    return {
+        "has_consult": has_consult,
+        "has_procedure": has_procedure,
+        "classify": classify,
+        "terjaring_ga": terjaring_ga,
+        "vip": vip,
+    }
 
-    sections = defaultdict(list)
-    current_section = "POLI INTEGRASI"
-    current = None
-    in_tindakan = False
-    last_key = None
+# ============ FORMAT OUTPUT ============
 
-    def push_current():
-        nonlocal current
-        if current:
-            # finalize tindakan
-            if "tindakan_list" in current:
-                current["tindakan"] = [t for t in current["tindakan_list"] if t]
-                del current["tindakan_list"]
-            sections[current_section].append(current)
-        current = None
+def pad2(n: int) -> str:
+    return f"{n:02d}"
 
-    for ln in lines:
-        if not ln.strip():
-            continue
+def format_header(title_line: str, counts: Dict[str, int]) -> str:
+    """
+    Format header rekap sesuai contoh.
+    """
+    return (
+        f"{title_line}\n\n"
+        f"Jumlah pasien    : {pad2(counts['total']) if counts['total']<100 else counts['total']} Pasien \n"
+        f"Tindakan             : {pad2(counts['tindakan']) if counts['tindakan']<100 else counts['tindakan']} Pasien \n"
+        f"Konsultasi           : {pad2(counts['konsultasi']) if counts['konsultasi']<100 else counts['konsultasi']} Pasien\n"
+        f"Terjaring GA        : {pad2(counts['ga']) if counts['ga']<100 else counts['ga']} Pasien\n"
+        f"VIP                       : {pad2(counts['vip']) if counts['vip']<100 else counts['vip']} Pasien\n"
+        f"Baksos                 : {pad2(counts['baksos']) if counts['baksos']<100 else counts['baksos']} Pasien \n\n"
+        f"------------------------------------------------------------\n\n"
+    )
 
-        # SECTION
-        if is_section_title(ln):
-            push_current()
-            current_section = canon_section(ln)
-            continue
+def format_section_title(name: str) -> str:
+    return f"{name.strip().upper()}\n"
 
-        # START PATIENT
-        m = START_BLOCK.match(ln)
-        if m:
-            push_current()
-            idx = int(m.group(1))
-            nama = strip_invisibles(m.group(2))
-            current = {"idx": idx, "nama": nama}
-            in_tindakan = False
-            last_key = None
-            continue
+def join_blocks(blocks: List[Dict[str, Any]]) -> str:
+    return "\n\n".join(b["block"].strip() for b in blocks if b["block"].strip())
 
-        if current is None:
-            continue
+def build_report(
+    all_blocks: List[Dict[str, Any]],
+    title_line: str,
+    proc_keywords: List[str],
+    ga_keywords: List[str],
+    exclude_postop_for_ga: bool = True,
+) -> Dict[str, Any]:
+    """
+    Mengembalikan dict:
+      - text_report
+      - counts
+      - grouped blocks (main/baksos)
+    """
+    # tandai klasifikasi tiap blok
+    enriched = []
+    for b in all_blocks:
+        cl = classify_block(b["block"], proc_keywords, ga_keywords, exclude_postop_for_ga)
+        enriched.append({**b, **cl})
 
-        # KEY : VALUE line
-        kv = KEY_PATTERN.match(ln)
-        if kv:
-            key_raw = kv.group(1).strip()
-            val = kv.group(2).strip()
-            std_key = None
-            for k, patt in FIELD_ALIASES.items():
-                if re.fullmatch(patt, key_raw, flags=re.I):
-                    std_key = k
-                    break
+    # kelompokkan BAKSOS vs non
+    main_blocks = [b for b in enriched if not (b["section"] or "").lower().startswith("baksos")]
+    baksos_blocks = [b for b in enriched if (b["section"] or "").lower().startswith("baksos")]
 
-            if std_key == "tindakan":
-                in_tindakan = True
-                last_key = "tindakan"
-                current.setdefault("tindakan_list", [])
-                if val:
-                    if val.startswith("*"):
-                        current["tindakan_list"].append(val[1:].strip())
-                    else:
-                        current["tindakan_list"].append(val)
-                continue
-            else:
-                in_tindakan = False
+    # hitung counts
+    # - total: semua blok (main + baksos)
+    # - tindakan: jumlah blok dengan classify=='TINDAKAN'
+    # - konsultasi: sisanya
+    # - ga: heuristik
+    # - vip: ada 'vip'
+    # - baksos: jumlah blok pada section baksos
+    total = len(enriched)
+    tindakan = sum(1 for b in enriched if b["classify"] == "TINDAKAN")
+    konsultasi = total - tindakan
+    ga = sum(1 for b in enriched if b["terjaring_ga"])
+    vip = sum(1 for b in enriched if b["vip"])
+    baksos = len(baksos_blocks)
 
-            if std_key:
-                # field biasa
-                current[std_key] = val
-                last_key = std_key
-            else:
-                last_key = None
-            continue
+    counts = dict(total=total, tindakan=tindakan, konsultasi=konsultasi, ga=ga, vip=vip, baksos=baksos)
 
-        # BULLET tindakan
-        if in_tindakan and ln.lstrip().startswith("*"):
-            current.setdefault("tindakan_list", []).append(ln.lstrip()[1:].strip())
-            continue
+    # susun teks laporan
+    parts = []
+    parts.append(format_header(title_line, counts))
+    if main_blocks:
+        parts.append(format_section_title("POLI INTEGRASI"))
+        parts.append(join_blocks(main_blocks))
+        parts.append("")  # newline
+    if baksos_blocks:
+        parts.append(format_section_title("BAKSOS CCC"))
+        parts.append(join_blocks(baksos_blocks))
+        parts.append("")  # newline
 
-        # MULTILINE untuk Diagnosa/Kontrol (atau field terakhir lain)
-        if last_key in ("diagnosa", "kontrol"):
-            # tambahkan baris lanjutan (tanpa tanda * )
-            extra = ln.lstrip()
-            if extra.startswith("*"):
-                # beberapa chat menaruh subtugas di diagnosa → simpan sebagai lanjutan teks
-                extra = extra[1:].strip()
-            joiner = "\n" if "\n" in current.get(last_key, "") else " "
-            current[last_key] = (current.get(last_key, "").rstrip() + joiner + extra).strip()
-            continue
+    report_text = "\n".join(p for p in parts if p is not None)
+    return {"text_report": report_text.strip() + "\n", "counts": counts,
+            "main_blocks": main_blocks, "baksos_blocks": baksos_blocks}
 
-        # Jika baris lanjutan field lain (mis. operator/telp pernah kebagi)
-        if last_key and last_key not in ("tindakan",):
-            current[last_key] = (current.get(last_key, "") + " " + ln.strip()).strip()
-            continue
+# ============ UI STREAMLIT ============
 
-    push_current()
-    return sections
+st.set_page_config(page_title="Rekap Poli BM RSGMP UNHAS", layout="wide")
 
-# ==========================
-# Dedup per section (RM>Nama), keep LAST
-# ==========================
-def dedup_keep_last_per_section(sections: dict):
-    deduped = {}
-    for sec, blocks in sections.items():
-        seen = {}
-        for b in blocks:
-            key = b.get("rm") or (b.get("nama") or "").lower()
-            if not key:
-                key = f"__noname_{b.get('idx','?')}"
-            seen[key] = b  # overwrite = last wins
-        # kembali ke list urut idx
-        arr = list(seen.values())
-        arr.sort(key=lambda x: int(x.get("idx", 9999)))
-        deduped[sec] = arr
-    return deduped
+st.title("Rekap Pasien Poli Bedah Mulut — WA Parser")
+st.caption("Upload chat WA (.docx/.txt) ➜ auto rekap ➜ output siap kirim")
 
-# ==========================
-# Formatting for WhatsApp
-# ==========================
-LBL_WIDTH = 14  # lebar label setelah bullet
-def line_kv(label, value):
-    # bullet '•' + dua spasi, label kiri rata, colon sejajar
-    return f"•  {label:<{LBL_WIDTH}}: {value}"
+with st.sidebar:
+    st.header("Pengaturan")
+    default_title = "Review jumlah pasien Poli Bedah Mulut dan Maksilofasial RSGMP UNHAS, Sabtu, (27/09/2025)"
+    title_line = st.text_area("Judul laporan", value=default_title, height=80)
 
-def format_patient(idx, b):
-    nama = b.get("nama", "-")
-    tgl = b.get("tgl", "-")
-    rm = b.get("rm", "-")
-    diagnosa = b.get("diagnosa", "-")
-    tindakan = b.get("tindakan", [])
-    if isinstance(tindakan, str):
-        tindakan = [tindakan] if tindakan else []
-    kontrol = b.get("kontrol", "-")
-    dpjp = canonicalize_dpjp(b.get("dpjp", ""))
-    telp = b.get("telp", "-")
-    operator = b.get("operator", "-")
+    st.markdown("**Kata kunci tindakan (untuk klasifikasi 'TINDAKAN')**")
+    user_proc = st.text_area(
+        "Pisahkan dengan koma",
+        value=", ".join(DEFAULT_PROCEDURE_KEYWORDS),
+        height=100
+    )
+    proc_keywords = [x.strip() for x in user_proc.split(",") if x.strip()]
 
-    lines = []
-    lines.append(f"{idx}. Nama            : {nama}")
-    lines.append(line_kv("Tanggal lahir", tgl))
-    lines.append(line_kv("RM", rm))
-    lines.append(line_kv("Diagnosa", diagnosa))
-    if tindakan:
-        lines.append(line_kv("Tindakan", ""))
-        for t in tindakan:
-            lines.append(f"   * {t}")
-    else:
-        lines.append(line_kv("Tindakan", "-"))
-    lines.append(line_kv("Kontrol", kontrol))
-    lines.append(line_kv("DPJP", dpjp))
-    lines.append(line_kv("No. Telp.", telp))
-    lines.append(line_kv("Operator", operator))
-    return "\n".join(lines), dpjp
+    st.markdown("**Kata kunci 'Terjaring GA'** (boleh edit):")
+    default_ga = [
+        "Pro ", "general anestesi", "Acc TS Anestesi", "Konsul TS. Anestesi",
+        "Konsul TS Anestesi", "Mouth Preparation", "GA", "CT BT HbsAg GDS Thorax"
+    ]
+    user_ga = st.text_area("Pisahkan dengan koma", value=", ".join(default_ga), height=80)
+    ga_keywords = [x.strip() for x in user_ga.split(",") if x.strip()]
 
-def format_summary_block(text):
-    # cari baris “Jumlah pasien”, “Tindakan”, dst lalu rata kolom
-    lines = []
-    for key in ["Jumlah pasien", "Tindakan", "Konsultasi", "Terjaring GA", "VIP", "Baksos"]:
-        m = re.search(rf"^{key}\s*:.*$", text, flags=re.I | re.M)
-        if m:
-            raw = strip_invisibles(m.group(0))
-            label, val = [t.strip() for t in raw.split(":", 1)]
-            lines.append(f"{label:<16}: {val}")
-    return lines
+    exclude_postop_for_ga = st.checkbox("JANGAN hitung kasus POD sebagai 'Terjaring GA'", value=True)
 
-def build_output(kop_title, raw_text, deduped_sections):
-    out = []
-    # KOP bold
-    if kop_title:
-        out.append(f"*{kop_title}*")
-        out.append("")
-    # summary numbers (optional)
-    out.extend(format_summary_block(raw_text))
-    if len(out) > 1:  # ada summary
-        out.append("")
-        out.append("-" * 60)
-        out.append("")
+    st.markdown("---")
+    st.caption("Tips: Kalau angka rekap belum pas, sesuaikan kata kunci di atas (terutama GA).")
 
-    all_dpjp_used = set()
-
-    # urutan section: POLI INTEGRASI, VIP, BAKSOS CCC, BAKSOS, lainnya
-    section_order = []
-    for s in ["POLI INTEGRASI", "VIP", "BAKSOS CCC", "BAKSOS"]:
-        if s in deduped_sections and deduped_sections[s]:
-            section_order.append(s)
-    # sisanya (kalau ada)
-    for s in deduped_sections.keys():
-        if s not in section_order and deduped_sections[s]:
-            section_order.append(s)
-
-    for sec in section_order:
-        out.append(f"*{sec}*")
-        out.append("")
-        blocks = deduped_sections[sec]
-        idx = 1
-        pretty = []
-        for b in blocks:
-            blk, dp = format_patient(idx, b)
-            pretty.append(blk)
-            if dp:
-                all_dpjp_used.add(canonicalize_dpjp(dp))
-            idx += 1
-        out.extend("\n\n".join(pretty).splitlines())
-        out.append("")
-
-    out.append("-" * 60)
-    out.append("")
-    # DPJP akhir (hanya yang dipakai, urut hirarki)
-    used_sorted = [d for d in DPJP_ORDER if d in all_dpjp_used]
-    if used_sorted:
-        out.append("*DPJP :*")
-        for i, d in enumerate(used_sorted, 1):
-            out.append(f"{i}. {d}")
-        out.append("")
-
-    return "\n".join(out).rstrip()
-
-# ==========================
-# Streamlit UI
-# ==========================
-st.set_page_config(page_title="Parser Review Poli BM → WhatsApp", layout="wide")
-st.title("Parser Review Poli BM → WhatsApp")
-
-uploaded = st.file_uploader("Upload chat (.docx)", type=["docx"])
-default_kop = f"Review jumlah pasien Poli Bedah Mulut dan Maksilofasial RSGMP UNHAS, {datetime.now().strftime('%A (%d/%m/%Y)')}"
-kop_title = st.text_input("Kop (akan di-bold)", value=default_kop)
+uploaded = st.file_uploader("Upload file chat WA (.docx atau .txt)", type=["docx", "txt"])
 
 if uploaded:
-    try:
-        doc = Document(io.BytesIO(uploaded.read()))
-        raw_text = "\n".join(p.text for p in doc.paragraphs)
-    except Exception as e:
-        st.error(f"Gagal membuka DOCX: {e}")
+    raw = read_text_from_upload(uploaded)
+    blocks = extract_blocks_with_section(raw)
+
+    if not blocks:
+        st.error("Tidak ada blok pasien terdeteksi. Pastikan format baris awal 'XX. Nama : ...' ada di teks.")
         st.stop()
 
-    raw_text_clean = "\n".join(strip_invisibles(x) for x in raw_text.splitlines())
+    st.success(f"Terbaca {len(blocks)} blok pasien. (Nomor pertama–terakhir: {blocks[0]['num']}–{blocks[-1]['num']})")
 
-    # Parsing
-    sections = parse_chat(raw_text_clean)
-    if not any(sections.values()):
-        st.error("Tidak ditemukan blok review dengan pola 'X. Nama : ...'. Pastikan format chat sesuai.")
-        st.stop()
+    res = build_report(
+        blocks,
+        title_line=title_line,
+        proc_keywords=proc_keywords,
+        ga_keywords=ga_keywords,
+        exclude_postop_for_ga=exclude_postop_for_ga,
+    )
 
-    # Dedup per section (pakai RM > Nama), ambil chat terakhir
-    deduped = dedup_keep_last_per_section(sections)
+    col1, col2 = st.columns([3,2], gap="large")
 
-    # Build WA text
-    final_text = build_output(kop_title.strip(), raw_text_clean, deduped)
+    with col1:
+        st.subheader("Preview Laporan (siap kirim)")
+        st.code(res["text_report"], language="markdown")
 
-    st.subheader("Hasil (siap copas ke WhatsApp)")
-    st.text_area("Output", value=final_text, height=700)
-    st.download_button("Download .txt", data=final_text.encode("utf-8"), file_name="review_poli_integrasi.txt")
+        st.download_button(
+            label="⬇️ Download .txt",
+            data=res["text_report"].encode("utf-8"),
+            file_name="rekap_poli_bm.txt",
+            mime="text/plain",
+        )
 
-    st.caption("Catatan: Parser tahan format WA, field multi-baris terjaga, DPJP dinormalisasi & dibold sesuai hirarki.")
+    with col2:
+        st.subheader("Rekap Otomatis")
+        c = res["counts"]
+        st.metric("Jumlah Pasien", c["total"])
+        st.metric("Tindakan", c["tindakan"])
+        st.metric("Konsultasi", c["konsultasi"])
+        st.metric("Terjaring GA", c["ga"])
+        st.metric("VIP", c["vip"])
+        st.metric("Baksos", c["baksos"])
+
+        with st.expander("Debug — lihat blok & klasifikasi"):
+            for b in (res["main_blocks"] + res["baksos_blocks"]):
+                st.markdown(f"**#{b['num']}** — *{b['section'] or 'POLI INTEGRASI'}* — `{b['classify']}`"
+                            f"{' — GA' if b['terjaring_ga'] else ''}{' — VIP' if b['vip'] else ''}")
+                st.code(b["block"], language="markdown")
+
 else:
-    st.info("Upload file .docx chat WA untuk diproses.")
+    st.info("📄 Silakan upload file dulu. Contoh yang didukung: ekspor chat WA hasil copy/paste ke .docx atau .txt")
