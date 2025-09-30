@@ -1,137 +1,116 @@
-import re
-import io
-import unicodedata
-from typing import List, Tuple, Dict, Any
+import re, io, unicodedata
+from typing import List
 import streamlit as st
 
-# ===== Helpers: load files =====
-def read_docx_bytes(file_bytes: bytes) -> str:
-    # python-docx sometimes chokes on zero-width chars. We strip before parse.
+# ========== IO helpers ==========
+def read_docx_bytes(b: bytes) -> str:
     from docx import Document
-    bio = io.BytesIO(file_bytes)
+    bio = io.BytesIO(b)
     doc = Document(bio)
-    paras = []
-    for p in doc.paragraphs:
-        paras.append(p.text)
-    return "\n".join(paras)
+    return "\n".join(p.text for p in doc.paragraphs)
 
-def read_pdf_bytes(file_bytes: bytes) -> str:
+def read_pdf_bytes(b: bytes) -> str:
     import pdfplumber
-    text_all = []
-    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-        for page in pdf.pages:
-            t = page.extract_text() or ""
-            text_all.append(t)
-    return "\n".join(text_all)
+    text = []
+    with pdfplumber.open(io.BytesIO(b)) as pdf:
+        for p in pdf.pages:
+            text.append(p.extract_text() or "")
+    return "\n".join(text)
 
-# ===== Normalization =====
-ZW = "".join(chr(c) for c in [0x200B, 0x200C, 0x200D, 0xFEFF])  # zero-width chars
+# ========== Normalization ==========
+def strip_format_chars(s: str) -> str:
+    # buang seluruh Unicode "format" (zero-width, joiner, feff, dsb)
+    return "".join(ch for ch in s if unicodedata.category(ch) != "Cf")
 
-def normalize(s: str) -> str:
-    # normalize bullets, colons, spaces, zero-width
-    s = s.replace("•", "•").replace("‧", "•").replace("·", "•")
-    s = s.replace("–", "-").replace("—", "-")
-    s = s.replace("：", ":")
-    s = s.replace("  ", " ")
-    s = re.sub(rf"[{ZW}]", "", s)
-    # NFKC helps equalize weird spacing
+def normalize_whitespace_keep_newlines(s: str) -> str:
+    # samakan spasi (termasuk NBSP, en/em space, dsb) -> spasi normal
+    # tapi JANGAN ganggu newline
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    s = s.replace("\u00A0", " ")
+    s = re.sub(r"[ \t\u2000-\u200A\u202F\u205F\u3000]+", " ", s)
+    return s
+
+def normalize_bullets(s: str) -> str:
+    # standarkan bullet di awal baris jadi "• "
+    s = re.sub(r"(?m)^\s*([·‧•◦▪▫●○\-\*])\s*", "• ", s)
+    return s
+
+def normalize_all(s: str) -> str:
+    s = strip_format_chars(s)
     s = unicodedata.normalize("NFKC", s)
-    # ensure bullets start with "• " (space) for easier regex
-    s = re.sub(r"\n\s*•\s*", "\n• ", s)
+    s = normalize_whitespace_keep_newlines(s)
+    s = normalize_bullets(s)
     return s
 
-# ===== Pre-clean WhatsApp noise =====
+# ========== WhatsApp noise stripper ==========
 WA_HEADER = re.compile(
-    r"^\s*\[\d{1,2}/\d{1,2}/\d{2,4},\s*\d{1,2}[:.]\d{2}[:.]?\d{0,2}\]\s*.+?:\s*$",
-    re.MULTILINE
+    r"(?m)^\s*\[\d{1,2}/\d{1,2}/\d{2,4},\s*\d{1,2}[:.]\d{2}(?::?\d{2})?\]\s*[^:\n]+:\s*$"
 )
-# Lines to drop entirely (common chatter)
 NOISE_LINE = re.compile(
-    r"^\s*(siap|baik|oke|ok|noted|tabe|izin|iya|betul|siap bang|baik bang|siap mbak|baik mbak|read more|readmore)\b.*$",
-    re.IGNORECASE
+    r"(?i)^\s*(siap|baik|ok(ay)?|oke|noted|tabe|izin|iya|betul|terima kasih|thanks|read\s*more)\b.*$"
 )
-# SOAP / laporan naratif panjang (kita drop blok yang jelas bukan format review)
-SOAP_ANCHOR = re.compile(
-    r"^\s*(Assalamualaikum|Maaf mengganggu|Status Generalis|Status Lokalis|S:|O:|A:|P:)\b",
-    re.IGNORECASE | re.MULTILINE
-)
+SOAP_ANCHOR = re.compile(r"(?im)^\s*(Assalamualaikum|Maaf mengganggu|S:|O:|A:|P:|Status\s+Generalis|Status\s+Lokalis)\b")
 
-def strip_whatsapp_noise(text: str) -> str:
-    lines = text.splitlines()
-    cleaned = []
-    skip_block = False
-    for ln in lines:
-        if WA_HEADER.match(ln.strip()):
-            # drop header baris
+def strip_whatsapp_noise(s: str) -> str:
+    out = []
+    for ln in s.splitlines():
+        if WA_HEADER.match(ln):                 # header WA
             continue
-        if NOISE_LINE.match(ln.strip()):
+        if NOISE_LINE.match(ln.strip()):        # chit-chat/templat
             continue
-        if SOAP_ANCHOR.match(ln.strip()):
-            # buang baris SOAP yang tidak dalam format review
+        if SOAP_ANCHOR.match(ln.strip()):       # laporan SOAP naratif
             continue
-        cleaned.append(ln)
-    s = "\n".join(cleaned)
-    # hapus potongan "‎Read more" yang muncul sebagai char khusus
-    s = re.sub(r"(?i)read\s*more", "", s)
-    return s
+        out.append(ln)
+    s2 = "\n".join(out)
+    s2 = re.sub(r"(?i)read\s*more", "", s2)     # sisa "Read more"
+    return s2
 
-# ===== Extract review blocks =====
-# Start anchor: "N. Nama :"
-REVIEW_START = re.compile(
-    r"(?im)^\s*(\d{1,3})[.)]?\s*Nama\s*:.*?$"
-)
+# ========== Review block detection ==========
+# Start blok: "N. Nama : ..."
+REVIEW_START = re.compile(r"(?im)^\s*(\d{1,3})[.)]?\s*Nama\s*:\s*.+?$")
+
+# Operator line (sangat toleran, bullet apapun, spasi bebas, ada ':')
+OP_LINE = re.compile(r"(?im)^[^\S\r\n]*[•\-\*][^\S\r\n]*Operator[^\S\r\n]*:[^\n]*$")
+
+# Label wajib (longgar)
+LBL = {
+    "nama": re.compile(r"(?im)^\s*\d{1,3}[.)]?\s*Nama\s*:\s*.+$"),
+    "tgl": re.compile(r"(?im)^\s*•\s*Tanggal\s*lahir\s*:\s*.+$"),
+    "rm": re.compile(r"(?im)^\s*•\s*RM\s*:\s*.+$"),
+    "dx": re.compile(r"(?im)^\s*•\s*Diagnosa\s*:\s*.+$"),
+    "tdk": re.compile(r"(?im)^\s*•\s*Tindakan\s*:\s*.+$"),
+    "ktr": re.compile(r"(?im)^\s*•\s*Kontrol\s*:\s*.*$"),
+    "dpjp": re.compile(r"(?im)^\s*•\s*DPJP\s*:\s*.+$"),
+    "telp": re.compile(r"(?im)^\s*•\s*No\.?\s*Telp\.?\s*:\s*.+$"),
+    "opr": OP_LINE
+}
 
 def split_candidate_blocks(text: str) -> List[str]:
-    # find all "N. Nama : ..." starts, split to next start
     starts = [m.start() for m in REVIEW_START.finditer(text)]
-    blocks = []
-    if not starts:
-        return blocks
+    if not starts: return []
     starts.append(len(text))
-    for i in range(len(starts)-1):
-        chunk = text[starts[i]:starts[i+1]]
-        blocks.append(chunk.strip())
+    blocks = [text[starts[i]:starts[i+1]].strip() for i in range(len(starts)-1)]
     return blocks
 
-def block_has_operator(block: str) -> bool:
-    # must contain Operator line before anything else
-    return re.search(r"(?im)^\s*•\s*Operator\s*:", block) is not None
-
-def is_true_review(block: str) -> bool:
-    need = [
-        r"^\s*\d{1,3}[.)]?\s*Nama\s*:",
-        r"^\s*•\s*Tanggal lahir\s*:",
-        r"^\s*•\s*RM\s*:",
-        r"^\s*•\s*Diagnosa\s*:",
-        r"^\s*•\s*Tindakan\s*:",
-        r"^\s*•\s*Kontrol\s*:",
-        r"^\s*•\s*DPJP\s*:",
-        r"^\s*•\s*No\.\s*Telp\.\s*:",
-        r"^\s*•\s*Operator\s*:",
-    ]
-    for pat in need:
-        if re.search(pat, block, flags=re.IGNORECASE | re.MULTILINE) is None:
-            return False
-    return block_has_operator(block)
-
 def clean_block_tail(block: str) -> str:
-    # truncate strictly at the Operator line (inclusive)
-    m = re.search(r"(?im)^\s*•\s*Operator\s*:.*$", block)
-    if not m:
-        return block
-    end = m.end()
-    return block[:end].rstrip()
+    # potong DI AKHIR kemunculan • Operator :
+    last = None
+    for m in OP_LINE.finditer(block):
+        last = m
+    if last:
+        return block[: last.end()].rstrip()
+    return block
+
+def has_all_labels(block: str) -> bool:
+    return all(p.search(block) is not None for p in LBL.values())
 
 def parse_name(block: str) -> str:
     m = re.search(r"(?im)^\s*\d{1,3}[.)]?\s*Nama\s*:\s*(.+?)\s*$", block)
-    if m:
-        return " ".join(m.group(1).split())
-    return ""
+    return " ".join(m.group(1).split()) if m else ""
 
-# ===== PDF precedence ordering =====
+# ========== PDF precedence ==========
 def names_from_pdf(pdf_text: str) -> List[str]:
-    t = normalize(pdf_text)
-    # ambil deret nama dari pola "Nama : X"
+    t = normalize_all(pdf_text)
     names = []
     for m in re.finditer(r"(?im)^\s*(?:\d{1,3}[.)]?\s*)?Nama\s*:\s*(.+?)\s*$", t):
         nm = " ".join(m.group(1).split())
@@ -139,80 +118,67 @@ def names_from_pdf(pdf_text: str) -> List[str]:
             names.append(nm)
     return names
 
-def order_blocks_by_pdf(blocks: List[str], pdf_names: List[str]) -> List[str]:
-    # map each block name to its index in pdf_names
-    key_map = {nm.lower(): i for i, nm in enumerate(pdf_names)}
-    def sort_key(b):
+def order_by_pdf(blocks: List[str], pdf_names: List[str]) -> List[str]:
+    idx = {nm.lower(): i for i, nm in enumerate(pdf_names)}
+    def key(b):
         nm = parse_name(b).lower()
-        return (0, key_map[nm]) if nm in key_map else (1, parse_name(b).lower())
-    return sorted(blocks, key=sort_key)
+        return (0, idx[nm]) if nm in idx else (1, nm)
+    return sorted(blocks, key=key)
 
-# ===== Counters =====
-ACTION_KEYWORDS = [
+# ========== Counters ==========
+ACTION_KW = [
     "odontektomi","ekstraksi","insisi","drainase","wound debridement","marsupialisasi",
-    "replantasi","reposisi","archbar","wiring","alveolektomi","sinus washout",
-    "enukleasi","apeks reseksi","debridement"
+    "replantasi","reposisi","archbar","wiring","alveolektomi","sinus washout","enukleasi",
+    "apeks reseksi","debridement"
 ]
-CONSULT_ONLY_HINTS = [
+CONSULT_HINT = [
     "konsultasi","periapikal","opg","x-ray","rujuk","kontrol luka","cuci luka",
-    "aff hecting","aff drain","aff archbar","pemeriksaan","laboratorium","thorax x-ray"
+    "aff hecting","aff drain","pemeriksaan","laboratorium","thorax x-ray"
 ]
 
 def classify_block(block: str) -> str:
-    tind = re.search(r"(?is)•\s*Tindakan\s*:(.+?)(?:^\s*•|\Z)", block)
-    segment = tind.group(1) if tind else ""
-    seg_clean = normalize(segment.lower())
-    # tindakan jika ada kata tindakan utama
-    if any(kw in seg_clean for kw in ACTION_KEYWORDS):
-        return "tindakan"
-    # kalau hanya konsultatif/supportive
-    if any(kw in seg_clean for kw in CONSULT_ONLY_HINTS):
-        return "konsultasi"
-    # fallback: konsultasi
+    m = re.search(r"(?is)^\s*•\s*Tindakan\s*:(.+?)(?:^\s*•|\Z)", block, re.MULTILINE)
+    seg = normalize_all(m.group(1) if m else "").lower()
+    if any(kw in seg for kw in ACTION_KW): return "tindakan"
+    if any(kw in seg for kw in CONSULT_HINT): return "konsultasi"
     return "konsultasi"
 
-def is_baksos_context(block: str, full_text_before: str) -> bool:
-    # lihat apakah sebelum blok ada heading BAKSOS dalam 50 baris sebelumnya
-    tail = "\n".join(full_text_before.splitlines()[-50:])
-    return re.search(r"(?i)BAKSOS", tail) is not None
-
-# ===== Render final text =====
-def renumber_blocks(blocks: List[str]) -> List[str]:
+def renumber(blocks: List[str]) -> List[str]:
     out = []
-    for i, b in enumerate(blocks, start=1):
+    for i, b in enumerate(blocks, 1):
         out.append(re.sub(r"(?im)^\s*\d{1,3}[.)]?\s*Nama", f"{i}. Nama", b, count=1))
     return out
 
-def build_header(date_str: str, totals: Dict[str,int]) -> str:
+def header(date_str: str, tot):
     return (
 f"Review jumlah pasien Poli Bedah Mulut dan Maksilofasial RSGMP UNHAS, Sabtu, ({date_str})\n\n"
-f"Jumlah pasien    : {totals['jumlah']:02d} Pasien \n"
-f"Tindakan             : {totals['tindakan']:02d} Pasien \n"
-f"Konsultasi           : {totals['konsultasi']:02d} Pasien\n"
-f"Terjaring GA        : {totals['ga']:02d} Pasien\n"
-f"VIP                       : {totals['vip']:02d} Pasien\n"
-f"Baksos                 : {totals['baksos']:02d} Pasien \n\n"
+f"Jumlah pasien    : {tot['jumlah']:02d} Pasien \n"
+f"Tindakan             : {tot['tindakan']:02d} Pasien \n"
+f"Konsultasi           : {tot['konsultasi']:02d} Pasien\n"
+f"Terjaring GA        : {tot['ga']:02d} Pasien\n"
+f"VIP                       : {tot['vip']:02d} Pasien\n"
+f"Baksos                 : {tot['baksos']:02d} Pasien \n\n"
 "------------------------------------------------------------\n\n"
 "POLI INTEGRASI\n"
     )
 
-def build_footer(chief: str, dpjp: List[str], date_str: str) -> str:
+def footer(chief: str, dpjp: List[str], date_str: str) -> str:
     lines = ["", "------------------------------------------------------------", "", f"Sabtu,  {date_str}", "", "Chief jaga poli :", chief, "", "DPJP :"]
-    for i, d in enumerate(dpjp, start=1):
+    for i, d in enumerate(dpjp, 1):
         lines.append(f"{i}. {d}")
     return "\n".join(lines)
 
-# ===== Streamlit UI =====
-st.set_page_config(page_title="Cleaner Review Poli", layout="wide")
-st.title("Cleaner Review Poli – PDF Precedence")
+# ========== UI ==========
+st.set_page_config(page_title="Cleaner Review Poli – Tahan Banting", layout="wide")
+st.title("Cleaner Review Poli – PDF Precedence & Hard Trim at Operator")
 
-col1, col2 = st.columns(2)
-with col1:
-    chat_file = st.file_uploader("Upload Chat WhatsApp (.docx atau .txt)", type=["docx","txt"])
-with col2:
+c1, c2 = st.columns(2)
+with c1:
+    chat_file = st.file_uploader("Upload Chat (.docx / .txt)", type=["docx","txt"])
+with c2:
     pdf_file = st.file_uploader("Upload PDF Laporan Pengunjung", type=["pdf"])
 
-date_str = st.text_input("Tanggal untuk header/footer (dd/mm/yyyy)", "27/09/2025")
+date_str = st.text_input("Tanggal header/footer (dd/mm/yyyy)", "27/09/2025")
 chief = st.text_input("Chief jaga poli", "drg. I Gede Surya Septaadinata")
 dpjp_default = [
     "Dr. drg. Andi Tajrin, M.Kes., Sp.B.M.M., Subsp. C.O.M.(K)",
@@ -221,115 +187,73 @@ dpjp_default = [
     "drg. Mukhtar Nur Anam, Sp.B.M.M",
     "drg. Timurwati, Sp.B.M.M",
     "drg. Husni Mubarak, Sp.B.M.M.",
-    "drg. Carolina Stevanie, Sp.B.M.M"
+    "drg. Carolina Stevanie, Sp.B.M.M",
 ]
 dpjp_text = st.text_area("DPJP (satu per baris)", "\n".join(dpjp_default), height=140)
 
-col3, col4, col5, col6 = st.columns(4)
-with col3:
-    vip_override = st.number_input("VIP (override)", min_value=0, value=0, step=1)
-with col4:
-    ga_override = st.number_input("Terjaring GA (override)", min_value=0, value=0, step=1)
-with col5:
-    baksos_override = st.number_input("Baksos (override)", min_value=0, value=0, step=1)
-with col6:
-    st.write(" ")
+colx = st.columns(3)
+vip_override = colx[0].number_input("VIP (override)", min_value=0, step=1, value=0)
+ga_override = colx[1].number_input("Terjaring GA (override)", min_value=0, step=1, value=0)
+baksos_override = colx[2].number_input("Baksos (override)", min_value=0, step=1, value=0)
 
 if st.button("Proses"):
     if not chat_file:
         st.error("Upload file chat dulu.")
         st.stop()
 
-    # ==== Read chat ====
-    if chat_file.type.endswith("text/plain") or chat_file.name.lower().endswith(".txt"):
-        chat_raw = chat_file.read().decode("utf-8", errors="ignore")
+    # Load chat
+    if chat_file.name.lower().endswith(".txt"):
+        raw = chat_file.read().decode("utf-8", errors="ignore")
     else:
-        chat_raw = read_docx_bytes(chat_file.read())
+        raw = read_docx_bytes(chat_file.read())
 
-    chat_norm = normalize(chat_raw)
-    chat_clean = strip_whatsapp_noise(chat_norm)
+    norm = normalize_all(raw)
+    no_wa = strip_whatsapp_noise(norm)
 
-    # ==== Candidate review blocks ====
-    cands = split_candidate_blocks(chat_clean)
-    review_blocks = []
-    # untuk deteksi baksos, kita butuh bagian 'before'; simpan offset
+    # Split -> bersihkan tail di Operator -> validasi label
+    cands = split_candidate_blocks(no_wa)
+    blocks = []
     for b in cands:
-        b2 = clean_block_tail(b)
-        if is_true_review(b2):
-            review_blocks.append(b2)
+        bt = clean_block_tail(b)
+        if has_all_labels(bt):
+            blocks.append(bt)
 
-    if not review_blocks:
-        st.warning("Tidak ketemu blok review yang valid (pastikan format tepat dan baris '• Operator :' ada).")
-        st.text_area("Chat (setelah dibersihkan)", chat_clean, height=250)
+    if not blocks:
+        st.error("Tidak ketemu blok review yang valid (cek lagi label & bullet). Lihat 'Debug input' di bawah.")
+        with st.expander("Debug input (normalized & cleaned)"):
+            st.code(no_wa[:5000])
         st.stop()
 
-    # ==== PDF order ====
-    pdf_names_order = []
+    # Urutan ikut PDF kalau ada
     if pdf_file:
         pdf_text = read_pdf_bytes(pdf_file.read())
-        pdf_names_order = names_from_pdf(pdf_text)
+        pdf_names = names_from_pdf(pdf_text)
+        if pdf_names:
+            blocks = order_by_pdf(blocks, pdf_names)
 
-    # ==== Sort by PDF precedence ====
-    if pdf_names_order:
-        review_blocks = order_blocks_by_pdf(review_blocks, pdf_names_order)
+    # Hitung ringkasan
+    jumlah = len(blocks)
+    tindakan = sum(1 for b in blocks if classify_block(b) == "tindakan")
+    konsultasi = jumlah - tindakan
+    ga = sum(1 for b in blocks if re.search(r"(?i)\bgeneral\s+anestesi\b|\bGA\b", b))
+    baksos = 0  # default manual override via input
 
-    # ==== Classify & count ====
-    jumlah = len(review_blocks)
-    tindakan = 0
-    konsultasi = 0
-    ga = 0
-    baksos = 0
-    vip = 0  # kalau nanti ada penandaan khusus VIP, bisa ditambah tag/keyword
+    # Override
+    vip = vip_override
+    if ga_override: ga = ga_override
+    if baksos_override: baksos = baksos_override
 
-    # terjaring GA: deteksi dari Diagnosa (mengandung "GA" sebagai general anestesi) atau rencana GA
-    for idx, b in enumerate(review_blocks):
-        cls = classify_block(b)
-        if cls == "tindakan":
-            tindakan += 1
-        else:
-            konsultasi += 1
+    totals = dict(jumlah=jumlah, tindakan=tindakan, konsultasi=konsultasi, ga=ga, vip=vip, baksos=baksos)
 
-        # GA detection (ringan)
-        if re.search(r"(?i)\bgeneral anestesi\b|\bGA\b", b):
-            ga += 1
+    # Renumber dan render
+    blocks = renumber(blocks)
+    final_txt = header(date_str, totals) + "\n\n".join(blocks) + "\n\n" + footer(chief, [x for x in dpjp_text.splitlines() if x.strip()], date_str)
 
-        # Baksos context: cek heading di chat sebelum blok aslinya
-        # (gunakan chat_clean sebagai konteks, cari potongan sebelum kemunculan nama)
-        nm = parse_name(b)
-        pos = chat_clean.lower().find(nm.lower())
-        if pos != -1 and is_baksos_context(b, chat_clean[:pos]):
-            baksos += 1
+    st.subheader("Hasil Akhir")
+    st.text_area("Siap copas", final_txt, height=600)
+    st.download_button("Download .txt", final_txt.encode("utf-8"), "review_final.txt", "text/plain")
 
-    # Override manual jika diisi
-    if vip_override:
-        vip = vip_override
-    if ga_override:
-        ga = ga_override
-    if baksos_override:
-        baksos = baksos_override
-
-    totals = {
-        "jumlah": jumlah,
-        "tindakan": tindakan,
-        "konsultasi": konsultasi,
-        "ga": ga,
-        "vip": vip,
-        "baksos": baksos
-    }
-
-    # ==== Renumber & Compose final text ====
-    review_blocks = renumber_blocks(review_blocks)
-    header = build_header(date_str, totals)
-    footer = build_footer(chief, [x.strip() for x in dpjp_text.splitlines() if x.strip()], date_str)
-    final_text = header + "\n\n".join(review_blocks) + "\n\n" + footer
-
-    st.subheader("Final Report")
-    st.text_area("Hasil akhir (siap copas)", final_text, height=600)
-
-    st.download_button("Download .txt", data=final_text.encode("utf-8"), file_name="review_final.txt", mime="text/plain")
-
-    # Debug/preview (opsional)
-    with st.expander("Preview blok review yang dipakai"):
-        for i, b in enumerate(review_blocks, 1):
+    with st.expander("Preview blok yang dipakai"):
+        for i, b in enumerate(blocks, 1):
             st.markdown(f"**Blok {i} – {parse_name(b)}**")
             st.code(b)
